@@ -1,7 +1,7 @@
 FROM python:3.9-slim
 
-# 🛠️ Install gcc and build tools for compiling tgcrypto
-RUN apt-get update && apt-get install -y gcc build-essential && apt-get clean
+# 🔧 Install required system packages (gcc + dependencies)
+RUN apt-get update && apt-get install -y gcc build-essential python3-dev && apt-get clean
 
 WORKDIR /app
 
