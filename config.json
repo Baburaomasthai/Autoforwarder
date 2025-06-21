@@ -1,4 +1,5 @@
 {
-  "source_channel": "@your_source_channel",
-  "target_channel": "@your_target_channel"
+  "source_channels": [],
+  "target_channel": "",
+  "running": true
 }
