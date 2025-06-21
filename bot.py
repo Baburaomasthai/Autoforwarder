@@ -1,295 +1,312 @@
-import os
 import json
-import re
 import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait
-from flask import Flask
-from threading import Thread
-from filelock import FileLock
-import asyncio
+import os
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    CommandHandler,
+)
+from telegram.error import TelegramError
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
-)
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Load environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH")
-ADMIN_IDS = json.loads(os.getenv("ADMIN_IDS", "[]"))  # e.g., "[123456789, 987654321]"
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-# Configuration files
 REPLACEMENTS_FILE = "replacements.json"
-CHANNELS_FILE = "channels.json"
-STATUS_FILE = "status.json"
+CONFIG_FILE = "config.json"
 
-# Initialize Pyrogram client
-app = Client("autoforward_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+# Bot state
+BOT_RUNNING = True
 
-# Flask for keep-alive (e.g., Replit, Railway, Render)
-flask_app = Flask('')
-
-@flask_app.route('/')
-def home():
-    return "Bot is running!"
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=8080)
-
-Thread(target=run_flask, daemon=True).start()
-
-# Load or create JSON data files
-def load_json(path, default):
-    with FileLock(path + ".lock"):
-        if not os.path.exists(path):
-            with open(path, "w") as f:
-                json.dump(default, f, indent=2)
-        with open(path, "r") as f:
-            return json.load(f)
-
-def save_json(path, data):
-    with FileLock(path + ".lock"):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
-# Initialize configuration
-replacements = load_json(REPLACEMENTS_FILE, {})
-channels = load_json(CHANNELS_FILE, {"sources": [], "target": None})
-status = load_json(STATUS_FILE, {"forwarding": False})
-
-# Validate channel (username or chat ID)
-async def validate_channel(channel):
+# Load JSON files
+def load_json(file, default=None):
+    if default is None:
+        default = {"links": {}, "words": {}, "sentences": {}} if file == REPLACEMENTS_FILE else {"source_channels": [], "target_channel": "", "running": True}
     try:
-        chat = await app.get_chat(channel)
-        return str(chat.id)
+        if not os.path.exists(file):
+            with open(file, "w") as f:
+                json.dump(default, f, indent=2)
+        with open(file, "r") as f:
+            return json.load(f)
     except Exception as e:
-        logger.error(f"Failed to validate channel {channel}: {e}")
-        return None
+        logger.error(f"Error loading {file}: {e}")
+        return default
 
-# Apply text replacements with regex
-def replace_text(text):
+def save_json(file, data):
+    try:
+        with open(file, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving {file}: {e}")
+
+replacements = load_json(REPLACEMENTS_FILE)
+config = load_json(CONFIG_FILE)
+
+# Apply replacements to text
+def apply_replacements(text):
     if not text:
         return text
-    for key, value in replacements.items():
-        if key.startswith(('http://', 'https://')):
-            text = re.sub(re.escape(key), value, text)
-        else:
-            text = re.sub(r'\b' + re.escape(key) + r'\b', value, text)
+    for old, new in replacements["links"].items():
+        text = text.replace(old, new)
+    for old, new in replacements["words"].items():
+        text = text.replace(old, new)
+    for old, new in replacements["sentences"].items():
+        text = text.replace(old, new)
     return text
 
-# Forward messages with rate limit handling
-async def forward_message_with_retry(message, target, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            if message.text:
-                new_text = replace_text(message.text)
-                await app.send_message(target, new_text)
-            elif message.photo:
-                new_caption = replace_text(message.caption or "")
-                await app.send_photo(target, message.photo.file_id, caption=new_caption)
-            elif message.video:
-                new_caption = replace_text(message.caption or "")
-                await app.send_video(target, message.video.file_id, caption=new_caption)
-            elif message.document:
-                new_caption = replace_text(message.caption or "")
-                await app.send_document(target, message.document.file_id, caption=new_caption)
-            elif message.sticker:
-                await app.send_sticker(target, message.sticker.file_id)
-            elif message.audio:
-                new_caption = replace_text(message.caption or "")
-                await app.send_audio(target, message.audio.file_id, caption=new_caption)
-            elif message.voice:
-                new_caption = replace_text(message.caption or "")
-                await app.send_voice(target, message.voice.file_id, caption=new_caption)
-            elif message.video_note:
-                await app.send_video_note(target, message.video_note.file_id)
-            elif message.animation:
-                new_caption = replace_text(message.caption or "")
-                await app.send_animation(target, message.animation.file_id, caption=new_caption)
-            else:
-                await message.copy(target)  # Fallback for unsupported types
-            return
-        except FloodWait as e:
-            logger.warning(f"FloodWait: Waiting {e.value} seconds")
-            await asyncio.sleep(e.value)
-        except Exception as e:
-            logger.error(f"Error forwarding message: {e}")
-            for admin_id in ADMIN_IDS:
-                await app.send_message(admin_id, f"⚠️ Error forwarding message: {e}")
-            return
-    logger.error("Max retries reached for forwarding message")
-    for admin_id in ADMIN_IDS:
-        await app.send_message(admin_id, "⚠️ Max retries reached for forwarding message")
-
-# Forwarder handler
-@app.on_message(filters.channel)
-async def forward_all(client, message: Message):
-    if not status["forwarding"] or not channels["target"]:
+# Forward message handler
+async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_RUNNING
+    if not BOT_RUNNING:
+        return
+    if not update.channel_post:
+        return
+    msg = update.channel_post
+    if msg.chat.username not in config["source_channels"] and str(msg.chat.id) not in config["source_channels"]:
         return
 
-    # Check if message is from a source channel
-    if str(message.chat.id) not in channels["sources"]:
-        return
+    try:
+       ಸ
+        if msg.text or msg.caption:
+            modified_text = apply_replacements(msg.text or msg.caption or "")
+            await context.bot.send_message(chat_id=config["target_channel"], text=modified_text)
+        elif msg.photo:
+            await context.bot.send_photo(chat_id=config["target_channel"], photo=msg.photo[-1].file_id, caption=apply_replacements(msg.caption or ""))
+        elif msg.video:
+            await context.bot.send_video(chat_id=config["target_channel"], video=msg.video.file_id, caption=apply_replacements(msg.caption or ""))
+        elif msg.document:
+            await context.bot.send_document(chat_id=config["target_channel"], document=msg.document.file_id, caption=apply_replacements(msg.caption or ""))
+        elif msg.sticker:
+            await context.bot.send_sticker(chat_id=config["target_channel"], sticker=msg.sticker.file_id)
+        elif msg.audio:
+            await context.bot.send_audio(chat_id=config["target_channel"], audio=msg.audio.file_id, caption=apply_replacements(msg.caption or ""))
+        elif msg.voice:
+            await context.bot.send_voice(chat_id=config["target_channel"], voice=msg.voice.file_id, caption=apply_replacements(msg.caption or ""))
+        elif msg.video_note:
+            await context.bot.send_video_note(chat_id=config["target_channel"], video_note=msg.video_note.file_id)
+        else:
+            await msg.copy(chat_id=config["target_channel"])
+    except TelegramError as e:
+        logger.error(f"Error forwarding message: {e}")
+        if str(e).lower().find("blocked by user") != -1 or str(e).lower().find("chat not found") != -1:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Error: Cannot send to target channel {config['target_channel']}. Check permissions or channel ID.")
 
-    await forward_message_with_retry(message, channels["target"])
+# Check if user is admin
+async def check_admin(update: Update):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Unauthorized: You are not the admin.")
+        return False
+    return True
 
 # Admin commands
-@app.on_message(filters.private & filters.user(ADMIN_IDS))
-async def admin_commands(client, message: Message):
-    text = message.text.lower()
-    args = message.text.split()
+async def start_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_RUNNING
+    if not await check_admin(update):
+        return
+    BOT_RUNNING = True
+    config["running"] = True
+    save_json(CONFIG_FILE, config)
+    await update.message.reply_text("✅ Bot forwarding started.")
 
-    if text.startswith(("/start", "/help")):
-        await message.reply(
-            "✅ Telegram Auto-Forwarder Bot\n\n"
-            "Commands:\n"
-            "/start, /help - Show this message\n"
-            "/ping - Check bot responsiveness\n"
-            "/addreplace old -> new - Add replacement rule\n"
-            "/removereplace old - Remove replacement rule\n"
-            "/clearreplacements - Clear all replacements\n"
-            "/listreplace - List replacements\n"
-            "/addsource channel - Add source channel\n"
-            "/removesource channel - Remove source channel\n"
-            "/listsource - List source channels\n"
-            "/settarget channel - Set target channel\n"
-            "/gettarget - Show target channel\n"
-            "/startfwd - Start forwarding\n"
-            "/stop - Stop forwarding\n"
-            "/status - Check bot status"
-        )
+async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_RUNNING
+    if not await check_admin(update):
+        return
+    BOT_RUNNING = False
+    config["running"] = False
+    save_json(CONFIG_FILE, config)
+    await update.message.reply_text("⛔ Bot forwarding stopped.")
 
-    elif text.startswith("/ping"):
-        await message.reply("🏓 Pong! Bot is alive.")
-
-    elif text.startswith("/addreplace"):
-        try:
-            parts = message.text.split(" -> ", 1)
-            if len(parts) != 2:
-                raise ValueError("Invalid format")
-            old, new = parts[1].split(" ", 1)
-            replacements[old] = new
-            save_json(REPLACEMENTS_FILE, replacements)
-            await message.reply(f"🔁 Added replacement: '{old}' -> '{new}'")
-        except:
-            await message.reply("❌ Usage: `/addreplace old -> new`")
-
-    elif text.startswith("/removereplace"):
-        try:
-            key = message.text.split(" ", 1)[1]
-            if key in replacements:
-                del replacements[key]
-                save_json(REPLACEMENTS_FILE, replacements)
-                await message.reply(f"❌ Removed replacement: '{key}'")
-            else:
-                await message.reply(f"❌ No replacement found for: '{key}'")
-        except:
-            await message.reply("❌ Usage: `/removereplace old`")
-
-    elif text.startswith("/clearreplacements"):
-        replacements.clear()
+async def add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        args = " ".join(context.args).split("=>")
+        if len(args) != 2:
+            raise ValueError
+        old, new = args[0].strip(), args[1].strip()
+        replacements["links"][old] = new
         save_json(REPLACEMENTS_FILE, replacements)
-        await message.reply("🧹 All replacements cleared.")
+        await update.message.reply_text(f"✅ Link replaced:\n{old} => {new}")
+    except Exception:
+        await update.message.reply_text("❌ Format: /addlink old => new")
 
-    elif text.startswith("/listreplace"):
-        if replacements:
-            reply = "🔁 Replacements:\n" + "\n".join([f"'{k}' ➤ '{v}'" for k, v in replacements.items()])
+async def add_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        args = " ".join(context.args).split("=>")
+        if len(args) != 2:
+            raise ValueError
+        old, new = args[0].strip(), args[1].strip()
+        replacements["words"][old] = new
+        save_json(REPLACEMENTS_FILE, replacements)
+        await update.message.reply_text(f"✅ Word replaced:\n{old} => {new}")
+    except Exception:
+        await update.message.reply_text("❌ Format: /addword old => new")
+
+async def add_sentence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        args = " ".join(context.args).split("=>")
+        if len(args) != 2:
+            raise ValueError
+        old, new = args[0].strip(), args[1].strip()
+        replacements["sentences"][old] = new
+        save_json(REPLACEMENTS_FILE, replacements)
+        await update.message.reply_text(f"✅ Sentence replaced:\n{old} => {new}")
+    except Exception:
+        await update.message.reply_text("❌ Format: /addsentence old => new")
+
+async def remove_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        link = " ".join(context.args).strip()
+        if link in replacements["links"]:
+            del replacements["links"][link]
+            save_json(REPLACEMENTS_FILE, replacements)
+            await update.message.reply_text(f"✅ Removed link: {link}")
         else:
-            reply = "No replacements set."
-        await message.reply(reply)
+            await update.message.reply_text("❌ Link not found.")
+    except Exception:
+        await update.message.reply_text("❌ Format: /removelink link")
 
-    elif text.startswith("/addsource"):
-        try:
-            channel = args[1]
-            chat_id = await validate_channel(channel)
-            if not chat_id:
-                await message.reply(f"❌ Invalid or inaccessible channel: {channel}")
-                return
-            if chat_id not in channels["sources"]:
-                channels["sources"].append(chat_id)
-                save_json(CHANNELS_FILE, channels)
-                await message.reply(f"✅ Added source channel: {channel} (ID: {chat_id})")
-            else:
-                await message.reply(f"❌ Channel {channel} is already a source.")
-        except:
-            await message.reply("❌ Usage: `/addsource @username or chat_id`")
+async def remove_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        word = " ".join(context.args).strip()
+        if word in replacements["words"]:
+            del replacements["words"][word]
+            save_json(REPLACEMENTS_FILE, replacements)
+            await update.message.reply_text(f"✅ Removed word: {word}")
+        else:
+            await update.message.reply_text("❌ Word not found.")
+    except Exception:
+        await update.message.reply_text("❌ Format: /removeword word")
 
-    elif text.startswith("/removesource"):
-        try:
-            channel = args[1]
-            chat_id = await validate_channel(channel)
-            if not chat_id:
-                await message.reply(f"❌ Invalid or inaccessible channel: {channel}")
-                return
-            if chat_id in channels["sources"]:
-                channels["sources"].remove(chat_id)
-                save_json(CHANNELS_FILE, channels)
-                await message.reply(f"❌ Removed source channel: {channel}")
-            else:
-                await message.reply(f"❌ Channel {channel} is not a source.")
-        except:
-            await message.reply("❌ Usage: `/removesource @username or chat_id`")
+async def remove_sentence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        sentence = " ".join(context.args).strip()
+        if sentence in replacements["sentences"]:
+            del replacements["sentences"][sentence]
+            save_json(REPLACEMENTS_FILE, replacements)
+            await update.message.reply_text(f"✅ Removed sentence: {sentence}")
+        else:
+            await update.message.reply_text("❌ Sentence not found.")
+    except Exception:
+        await update.message.reply_text("❌ Format: /removesentence sentence")
 
-    elif text.startswith("/listsource"):
-        reply = "📡 Source Channels:\n" + "\n".join(channels["sources"]) if channels["sources"] else "No sources set."
-        await message.reply(reply)
+async def add_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        channel = context.args[0].strip()
+        if channel not in config["source_channels"]:
+            config["source_channels"].append(channel)
+            save_json(CONFIG_FILE, config)
+            await update.message.reply_text(f"✅ Added source channel: {channel}")
+        else:
+            await update.message.reply_text(f"❌ Channel {channel} already added.")
+    except Exception:
+        await update.message.reply_text("❌ Format: /addsource @channel")
 
-    elif text.startswith("/settarget"):
-        try:
-            channel = args[1]
-            chat_id = await validate_channel(channel)
-            if not chat_id:
-                await message.reply(f"❌ Invalid or inaccessible channel: {channel}")
-                return
-            channels["target"] = chat_id
-            save_json(CHANNELS_FILE, channels)
-            await message.reply(f"🎯 Set target channel: {channel} (ID: {chat_id})")
-        except:
-            await message.reply("❌ Usage: `/settarget @username or chat_id`")
+async def remove_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        channel = context.args[0].strip()
+        if channel in config["source_channels"]:
+            config["source_channels"].remove(channel)
+            save_json(CONFIG_FILE, config)
+            await update.message.reply_text(f"✅ Removed source channel: {channel}")
+        else:
+            await update.message.reply_text(f"❌ Channel {channel} not found.")
+    except Exception:
+        await update.message.reply_text("❌ Format: /removesource @channel")
 
-    elif text.startswith("/gettarget"):
-        target = channels["target"]
-        await message.reply(f"🎯 Current target: {target}" if target else "No target set.")
+async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    try:
+        config["target_channel"] = context.args[0].strip()
+        save_json(CONFIG_FILE, config)
+        await update.message.reply_text(f"✅ Target channel set: {config['target_channel']}")
+    except Exception:
+        await update.message.reply_text("❌ Format: /setdst @channel")
 
-    elif text.startswith("/startfwd"):
-        if not channels["sources"] or not channels["target"]:
-            await message.reply("❌ Set source and target channels first.")
-            return
-        status["forwarding"] = True
-        save_json(STATUS_FILE, status)
-        await message.reply("✅ Forwarding started.")
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    status = "running" if BOT_RUNNING else "stopped"
+    await update.message.reply_text(
+        f"📊 Bot Status:\n"
+        f"Running: {status}\n"
+        f"Source Channels: {', '.join(config['source_channels']) or 'None'}\n"
+        f"Target Channel: {config['target_channel'] or 'None'}\n"
+        f"Replacements: {len(replacements['links']) + len(replacements['words']) + len(replacements['sentences'])} active"
+    )
 
-    elif text.startswith("/stop"):
-        status["forwarding"] = False
-        save_json(STATUS_FILE, status)
-        await message.reply("⛔ Forwarding stopped.")
+async def show_replacements(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        return
+    if not any(replacements.values()):
+        await update.message.reply_text("📌 No replacements configured.")
+        return
+    await update.message.reply_text(
+        f"📌 Replacements:\n```json\n{json.dumps(replacements, indent=2, ensure_ascii=False)}```",
+        parse_mode="Markdown",
+    )
 
-    elif text.startswith("/status"):
-        status_text = (
-            f"Bot Status:\n"
-            f"Forwarding: {'ON' if status['forwarding'] else 'OFF'}\n"
-            f"Source Channels: {', '.join(channels['sources']) or 'None'}\n"
-            f"Target Channel: {channels['target'] or 'None'}\n"
-            f"Replacements: {len(replacements)}"
-        )
-        await message.reply(status_text)
+# Error handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused error: {context.error}")
+    if update and update.effective_user.id == ADMIN_ID:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Error: {context.error}")
 
-    else:
-        await message.reply("❌ Unknown command. Use /help for commands.")
+# Main function
+def main():
+    if not BOT_TOKEN or not ADMIN_ID:
+        logger.error("BOT_TOKEN or ADMIN_ID not set in .env file.")
+        return
 
-# Start bot
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Handlers
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, forward_message))
+    app.add_handler(CommandHandler("startbot", start_bot))
+    app.add_handler(CommandHandler("stopbot", stop_bot))
+    app.add_handler(CommandHandler("addlink", add_link))
+    app.add_handler(CommandHandler("addword", add_word))
+    app.add_handler(CommandHandler("addsentence", add_sentence))
+    app.add_handler(Removed in the following line to avoid redundancy)
+    app.add_handler(CommandHandler("removelink", remove_link))
+    app.add_handler(CommandHandler("removeword", remove_word))
+    app.add_handler(CommandHandler("removesentence", remove_sentence))
+    app.add_handler(CommandHandler("addsource", add_source))
+    app.add_handler(CommandHandler("removesource", remove_source))
+    app.add_handler(CommandHandler("setdst", set_target))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("showreplacements", show_replacements))
+
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    logger.info("Starting bot...")
+    app.run_polling()
+
 if __name__ == "__main__":
-    if not all([BOT_TOKEN, API_ID, API_HASH, ADMIN_IDS]):
-        logger.error("Missing environment variables: BOT_TOKEN, API_ID, API_HASH, or ADMIN_IDS")
-        exit(1)
-    logger.info("Starting Telegram Auto-Forwarder Bot...")
-    app.run()
+    main()
