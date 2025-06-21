@@ -1,3 +1,4 @@
-feedparser
-python-dotenv
-python-telegram-bot==20.6
+pyrogram==2.0.106
+tgcrypto
+flask
+filelock
