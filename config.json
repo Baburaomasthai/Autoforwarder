@@ -1,0 +1,7 @@
+{
+  "source_channels": [
+    "@example_source_channel"
+  ],
+  "target_channel": "@example_target_channel",
+  "running": true
+}
