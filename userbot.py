@@ -1,13 +1,3 @@
-"""
-Auto Forward Bot
-  - Telethon userbot  : channels se messages forward karta hai
-  - python-telegram-bot: inline-button control panel (saare commands bhi kaam karte hain)
-
-Required environment variables:
-  API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, ADMIN_USER_ID, MONGODB_URL
-Optional:
-  PORT (default 5000), MAPPING_TTL_DAYS (default 30)
-"""
 import asyncio
 import logging
 import os
